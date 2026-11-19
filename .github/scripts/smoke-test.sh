@@ -56,7 +56,10 @@ echo "ok: ${actual_nginx}"
 docker exec "${name}" nginx -t >/dev/null 2>&1 || fail 'nginx -t failed'
 echo 'ok: nginx configuration is valid'
 
-docker logs "${name}" 2>&1 | grep -qxF "HTTPS-PORTAL v${expected_version}" ||
+# Capture first: with pipefail, `docker logs | grep -q` fails when grep exits on the first
+# match and docker logs dies of SIGPIPE.
+logs="$(docker logs "${name}" 2>&1)"
+grep -qxF "HTTPS-PORTAL v${expected_version}" <<< "${logs}" ||
   fail "banner 'HTTPS-PORTAL v${expected_version}' not found in the logs"
 echo "ok: banner HTTPS-PORTAL v${expected_version}"
 
