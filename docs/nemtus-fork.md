@@ -18,12 +18,49 @@ The fork publishes the same image to GHCR as `ghcr.io/nemtus/https-portal`.
 The NEMTUS layer is deliberately small:
 
 - `.github/workflows/nemtus-image.yml` — build, smoke test and publish to GHCR
+- `.github/workflows/mirror-sync.yml` — daily upstream sync and release watch
 - `.github/scripts/smoke-test.sh` — the smoke test, runnable locally
+- `.github/scripts/review-upstream-diff.sh` — mechanical review of an upstream diff
 - `docs/nemtus-fork.md` — this file
 
 Anything else that differs from upstream should be a fix that is also proposed upstream.
 
-## Syncing with upstream
+## Automation
+
+`mirror-sync.yml` runs daily (and on demand) and does two things.
+
+**Sync.** When upstream `master` has commits that `nemtus` lacks, it:
+
+1. Reviews the diff with `review-upstream-diff.sh` and classifies it:
+   - `routine` — only version lines changed (nginx, s6-overlay, docker-gen, acme-tiny, the
+     `00-welcome` banner);
+   - `needs review` — anything else; the report lists new download hosts, pipe-to-shell and
+     similar patterns, binaries, opaque strings, mode changes and every file outside the
+     version lines;
+   - `blocked` — the diff touches `.github/`. Merged, those files would run with this
+     repository's privileges, so the run fails and nothing is pushed. Review upstream by
+     hand and sync manually if it is legitimate.
+2. Fast-forwards the `master` mirror.
+3. Waits out a cooldown of 3 days (`COOLDOWN_DAYS`) since upstream's branch last moved. A
+   bad upstream change is usually noticed and reverted within days. For an urgent security
+   fix, run the workflow manually with `skip_cooldown`.
+4. Opens a pull request `sync/upstream-<sha>` into `nemtus`, titled `[routine]` or
+   `[needs review]`, with the report in its body, and starts the `build` check on it.
+
+**Release watch.** Reports when upstream's latest release is not contained in the latest
+`nemtus-v*` release, with the tag to push. It never tags or publishes.
+
+Notifications go to Discord through the repository secret `DISCORD_WEBHOOK_URL` (skipped
+when it is not set): failures, new upstream commits, an opened sync pull request, and a
+pending release (on the day upstream releases, then every Monday).
+
+The review script is a tripwire, not a malware detector, and it does not see what the
+Dockerfile downloads at build time (the base image and release archives are fetched by
+version, without checksums). The gates that matter are human: reading the sync pull
+request before merging it, and pushing the signed release tag. `nemtus-image.yml` refuses
+to publish a commit that is not on `nemtus`.
+
+## Syncing with upstream by hand
 
 Bring upstream changes into `nemtus` with a **merge commit, never a squash or rebase**, so
 ancestry is preserved for later syncs:
@@ -64,6 +101,10 @@ updates), either re-run the workflow on the existing tag with `push: true`, or p
   default branch).
 - After the first publish, set the `https-portal` package visibility to public if it should
   be pullable without authentication.
+- Add the repository secret `DISCORD_WEBHOOK_URL` for notifications.
+- Rulesets: `nemtus` requires a pull request (merge commits only) and the `build` check;
+  `master` and all tags cannot be deleted or force-pushed; creating `nemtus-v*` tags is
+  restricted to admins.
 
 ## Testing
 

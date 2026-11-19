@@ -1,0 +1,361 @@
+name: mirror-sync (upstream SteveLTN/https-portal)
+
+# Follows upstream github.com/SteveLTN/https-portal:master and reports when NEMTUS has a
+# release to make. See docs/nemtus-fork.md ("Automation").
+#
+# `sync` (daily):
+#   1. Reviews the new upstream commits with .github/scripts/review-upstream-diff.sh.
+#      A diff that touches .github/ is BLOCKED: merged, those files would run with this
+#      repository's privileges. The run fails and nothing is pushed.
+#   2. Fast-forwards the `master` mirror to upstream.
+#   3. Waits out a cooldown (COOLDOWN_DAYS since upstream's branch last moved, taken from
+#      GitHub's activity log, not from commit dates, which the author controls). A bad
+#      upstream change is usually noticed and reverted within days; not picking it up the
+#      moment it lands keeps it out of this fork. Dispatch with `skip_cooldown` for an
+#      urgent security fix.
+#   4. Merges upstream into a `sync/upstream-<sha>` branch and opens a pull request into
+#      `nemtus` with the review report in its body, titled [routine] or [needs review].
+#      Merge it with a MERGE COMMIT. A conflict fails the run with the details in the job
+#      summary.
+#
+#   This job has a write token, so it must never execute upstream code: it runs git and
+#   the review script from the trusted `nemtus` checkout only. Building happens in
+#   nemtus-image.yml with a read-only token.
+#
+# `release-watch` (daily, read-only): reports when upstream's latest release is not
+#   contained in the latest `nemtus-v*` release. Releasing stays a human decision: the tag
+#   is signed and restricted to admins.
+#
+# `notify`: posts to Discord (repository secret DISCORD_WEBHOOK_URL; skipped when unset)
+#   when a run fails, when new upstream commits are first seen, when a sync pull request
+#   is opened, and when a release is pending (on the day upstream releases, then Mondays).
+#
+# `keepalive`: resets GitHub's 60-day scheduled-workflow auto-disable clock.
+
+on:
+  schedule:
+    - cron: '23 3 * * *'  # daily, 03:23 UTC
+  workflow_dispatch:
+    inputs:
+      skip_cooldown:
+        description: 'Open the sync pull request now, without waiting out the cooldown'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: SteveLTN/https-portal
+  UPSTREAM_BRANCH: master
+  MIRROR_BRANCH: master
+  LOCAL_BRANCH: nemtus
+  COOLDOWN_DAYS: 3
+  # This repository is a fork: without GH_REPO, gh targets the parent repository.
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    outputs:
+      message: ${{ steps.sync.outputs.message }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: nemtus
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Sync upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKIP_COOLDOWN: ${{ inputs.skip_cooldown }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          upstream_url="https://github.com/${UPSTREAM_REPO}.git"
+          git remote add upstream "${upstream_url}"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          git fetch --no-tags origin "+refs/heads/${MIRROR_BRANCH}:refs/remotes/origin/${MIRROR_BRANCH}"
+          upstream="upstream/${UPSTREAM_BRANCH}"
+          upstream_sha="$(git rev-parse "${upstream}")"
+          short="$(git rev-parse --short "${upstream}")"
+          sync_branch="sync/upstream-${short}"
+          say() { echo "message=$1" >> "$GITHUB_OUTPUT"; }
+
+          # Close automated sync pull requests that a newer one (or the base) supersedes.
+          # Only bot-authored pull requests whose head commit the bot made; a branch a
+          # human pushed to is left alone.
+          close_superseded() {
+            local keep="$1" reason="$2" number branch committer
+            while read -r number branch; do
+              [ -n "${number}" ] && [ "${branch}" != "${keep}" ] || continue
+              committer="$(gh api "repos/${GH_REPO}/commits/${branch}" --jq '.commit.committer.email' || true)"
+              if [ "${committer}" != 'github-actions[bot]@users.noreply.github.com' ]; then
+                echo "::notice::#${number} (${branch}) has commits not made by the sync bot; leaving it open."
+                continue
+              fi
+              gh pr close "${number}" --delete-branch --comment "${reason}" ||
+                echo "::warning::could not close #${number}"
+            done < <(gh pr list --base "${LOCAL_BRANCH}" --state open --limit 100 \
+              --json number,headRefName,author \
+              --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | select(.author.is_bot) | "\(.number) \(.headRefName)"')
+          }
+
+          if git merge-base --is-ancestor "${upstream}" HEAD; then
+            echo "Up to date with upstream@${short}." | tee -a "$GITHUB_STEP_SUMMARY"
+            close_superseded '' "\`${LOCAL_BRANCH}\` already contains every upstream commit this pull request would merge."
+            exit 0
+          fi
+
+          # 1. Review. The script comes from the nemtus checkout and only reads git objects.
+          base="$(git merge-base HEAD "${upstream}")"
+          set +e
+          report="$(.github/scripts/review-upstream-diff.sh "${base}" "${upstream}")"
+          verdict=$?
+          set -e
+          printf '%s\n' "${report}" >> "$GITHUB_STEP_SUMMARY"
+          case "${verdict}" in
+            0) label='routine' ;;
+            3) label='needs review' ;;
+            4)
+              say "BLOCKED: upstream@${short} touches .github/. Nothing was synced; review the upstream diff by hand."
+              echo "::error::upstream@${short} touches .github/; refusing to sync."
+              exit 1
+              ;;
+            *)
+              echo "::error::review-upstream-diff.sh failed (exit ${verdict})"
+              exit 1
+              ;;
+          esac
+
+          # 2. Fast-forward the mirror branch.
+          first_seen=''
+          if [ "$(git rev-parse "origin/${MIRROR_BRANCH}")" != "${upstream_sha}" ]; then
+            if ! git merge-base --is-ancestor "origin/${MIRROR_BRANCH}" "${upstream}"; then
+              say "FAILED: ${MIRROR_BRANCH} cannot be fast-forwarded to upstream@${short} (upstream history was rewritten, or ${MIRROR_BRANCH} has local commits)."
+              echo "::error::${MIRROR_BRANCH} is not an ancestor of upstream@${short}."
+              exit 1
+            fi
+            git push origin "${upstream_sha}:refs/heads/${MIRROR_BRANCH}"
+            first_seen=1
+          fi
+          compare="${GITHUB_SERVER_URL}/${GH_REPO}/compare/${LOCAL_BRANCH}...${MIRROR_BRANCH}"
+
+          # 3. Cooldown, measured from when upstream's branch last moved.
+          if [ "${SKIP_COOLDOWN}" != 'true' ]; then
+            moved_at="$(gh api "repos/${UPSTREAM_REPO}/activity?ref=${UPSTREAM_BRANCH}&per_page=1" \
+              --jq "map(select(.after == \"${upstream_sha}\")) | .[0].timestamp // empty")"
+            if [ -z "${moved_at}" ]; then
+              # Upstream moved between the fetch and the API call, or the entry is missing:
+              # count from now. The next run sees a consistent state.
+              moved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            fi
+            ready_epoch="$(( $(date -u -d "${moved_at}" +%s) + COOLDOWN_DAYS * 86400 ))"
+            ready_at="$(date -u -d "@${ready_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+            if [ "$(date -u +%s)" -lt "${ready_epoch}" ]; then
+              {
+                echo
+                echo "Cooldown: upstream@${short} landed ${moved_at}; the sync pull request opens after ${ready_at}."
+                echo "Dispatch this workflow with \`skip_cooldown\` to open it now."
+              } >> "$GITHUB_STEP_SUMMARY"
+              if [ -n "${first_seen}" ]; then
+                say "New upstream commits (upstream@${short}, ${label}). Sync pull request opens after ${ready_at}; dispatch with skip_cooldown for an urgent fix. ${compare}"
+              fi
+              exit 0
+            fi
+          fi
+
+          # 4. Merge into a sync branch and open the pull request.
+          if git ls-remote --exit-code --heads origin "${sync_branch}" > /dev/null; then
+            echo "${sync_branch} already exists on origin; not rebuilding it."
+          else
+            git checkout -b "${sync_branch}"
+            if ! git merge --no-ff -m "Merge upstream ${UPSTREAM_REPO}:${UPSTREAM_BRANCH}@${short} into ${LOCAL_BRANCH}" "${upstream}"; then
+              conflicts="$(git diff --name-only --diff-filter=U | sort)"
+              hunks="$(git diff --diff-filter=U | head -c 60000)"
+              git merge --abort
+              {
+                echo
+                echo "## Upstream sync conflict: ${UPSTREAM_REPO}@${short}"
+                echo
+                echo 'Conflicting files:'
+                echo '```'
+                echo "${conflicts}"
+                echo '```'
+                echo '```diff'
+                echo "${hunks}"
+                echo '```'
+                echo 'Resolve locally (merge commit, not squash):'
+                echo '```bash'
+                echo "git fetch origin && git switch -c ${sync_branch} origin/${LOCAL_BRANCH}"
+                echo "git merge --no-ff origin/${MIRROR_BRANCH}"
+                echo '# resolve, keeping the NEMTUS layer (docs/nemtus-fork.md), then:'
+                echo "git push -u origin ${sync_branch}"
+                echo "gh pr create -R ${GH_REPO} --base ${LOCAL_BRANCH} --title 'Sync upstream ${UPSTREAM_REPO}:${UPSTREAM_BRANCH}@${short}'"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              say "FAILED: upstream@${short} conflicts with ${LOCAL_BRANCH}; resolve by hand (steps in the job summary)."
+              echo "::error::upstream@${short} does not merge cleanly into ${LOCAL_BRANCH}."
+              exit 1
+            fi
+            git push -u origin "${sync_branch}"
+          fi
+
+          pr_url="$(gh pr list --head "${sync_branch}" --base "${LOCAL_BRANCH}" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "${pr_url}" ]; then
+            echo "Sync pull request already open: ${pr_url}" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          body="$(printf '%s\n' \
+            "Automated mirror sync. Merges upstream \`${UPSTREAM_REPO}:${UPSTREAM_BRANCH}\`@\`${short}\` into \`${LOCAL_BRANCH}\`." \
+            '' \
+            '**Merge this pull request with a MERGE COMMIT (not squash).** Squashing drops the upstream parent, and every later sync would replay upstream history.' \
+            '' \
+            'Read the upstream diff before merging: nothing here is published until a `nemtus-v*` tag is pushed, but this merge is the review gate.' \
+            '' \
+            "${report}")"
+          pr_url="$(gh pr create --base "${LOCAL_BRANCH}" --head "${sync_branch}" \
+            --title "Sync upstream ${UPSTREAM_REPO}:${UPSTREAM_BRANCH}@${short} [${label}]" \
+            --body "${body}")"
+          echo "Opened ${pr_url}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # A pull request opened with GITHUB_TOKEN does not trigger pull_request
+          # workflows, so start the required `build` check on the sync branch explicitly.
+          gh workflow run nemtus-image.yml --ref "${sync_branch}" ||
+            echo "::warning::could not start nemtus-image.yml on ${sync_branch}; run it by hand."
+
+          close_superseded "${sync_branch}" "Superseded by ${pr_url}, which merges a newer upstream head."
+          say "Sync pull request opened (${label}): ${pr_url}"
+
+  release-watch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      message: ${{ steps.watch.outputs.message }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: nemtus
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare upstream's latest release with the latest NEMTUS release
+        id: watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags origin
+
+          release="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')"
+          published="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.published_at')"
+          if ! printf '%s' "${release}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::unexpected upstream release tag '${release}'"
+            exit 1
+          fi
+          git fetch --quiet --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            "+refs/tags/${release}:refs/upstream-tags/${release}"
+          release_commit="$(git rev-parse "refs/upstream-tags/${release}^{commit}")"
+
+          latest="$(git tag --list 'nemtus-v*' --sort=-creatordate | head -n 1)"
+          {
+            echo '## Release watch'
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| upstream latest release | \`${release}\` (\`${release_commit:0:7}\`, published ${published}) |"
+            echo "| NEMTUS latest release | \`${latest:-none}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${latest}" ] && git merge-base --is-ancestor "${release_commit}" "${latest}^{commit}"; then
+            echo "| status | up to date |" >> "$GITHUB_STEP_SUMMARY"
+            if ! git diff --quiet "${latest}" "origin/${LOCAL_BRANCH}" -- Dockerfile fs_overlay; then
+              echo "| note | \`${LOCAL_BRANCH}\` has unreleased image changes since \`${latest}\` |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+
+          # Next free tag for this upstream version: nemtus-vX.Y.Z, then -2, -3, ...
+          count="$(git tag --list "nemtus-v${release}" "nemtus-v${release}-*" | wc -l)"
+          if [ "${count}" -eq 0 ]; then
+            next="nemtus-v${release}"
+          else
+            next="nemtus-v${release}-$((count + 1))"
+          fi
+          if git merge-base --is-ancestor "${release_commit}" "origin/${LOCAL_BRANCH}"; then
+            action="\`${LOCAL_BRANCH}\` already contains it; release by pushing a signed \`${next}\` tag."
+          else
+            action="Merge the sync pull request into \`${LOCAL_BRANCH}\` first, then push a signed \`${next}\` tag."
+          fi
+          echo "| status | **release pending**: ${action} |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Notify on the day upstream releases, then weekly, and on a manual run.
+          age="$(( $(date -u +%s) - $(date -u -d "${published}" +%s) ))"
+          if [ "${age}" -lt 93600 ] || [ "$(date -u +%u)" = 1 ] || [ "${GITHUB_EVENT_NAME}" = workflow_dispatch ]; then
+            echo "message=Release pending: upstream released ${release} (${published}) and ${latest:-no NEMTUS release} does not contain it. ${action}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Reset GitHub's 60-day scheduled-workflow auto-disable clock.
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable scheduled workflows (60-day inactivity guard)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/mirror-sync.yml/enable"
+
+  # No third-party action: plain curl.
+  notify:
+    needs: [sync, release-watch]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Notify Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          SYNC_MESSAGE: ${{ needs.sync.outputs.message }}
+          WATCH_RESULT: ${{ needs.release-watch.result }}
+          WATCH_MESSAGE: ${{ needs.release-watch.outputs.message }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          lines=()
+          [ -z "${SYNC_MESSAGE}" ] || lines+=("${SYNC_MESSAGE}")
+          if [ "${SYNC_RESULT}" != success ] && [ -z "${SYNC_MESSAGE}" ]; then
+            lines+=("FAILED: sync job ended with '${SYNC_RESULT}'.")
+          fi
+          [ -z "${WATCH_MESSAGE}" ] || lines+=("${WATCH_MESSAGE}")
+          if [ "${WATCH_RESULT}" != success ]; then
+            lines+=("FAILED: release-watch job ended with '${WATCH_RESULT}'.")
+          fi
+          if [ "${#lines[@]}" -eq 0 ]; then
+            echo 'Nothing to report.'
+            exit 0
+          fi
+          content="$(printf '[mirror-sync] %s\n' "${lines[@]}")"
+          content="$(printf '%s\n%s' "${content}" "${run_url}" | head -c 1900)"
+          echo "${content}"
+          if [ -z "${WEBHOOK}" ]; then
+            echo 'DISCORD_WEBHOOK_URL not configured; skipping notification.'
+            exit 0
+          fi
+          payload="$(jq -n --arg c "${content}" '{content: $c}')"
+          curl -fsS -H 'Content-Type: application/json' -d "${payload}" "${WEBHOOK}"
