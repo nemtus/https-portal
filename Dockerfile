@@ -1,4 +1,4 @@
-ARG  DIST=nginx:1.30.7
+ARG  DIST=nginx:1.31.9
 FROM $DIST
 
 # Set by `docker buildx build`
@@ -21,7 +21,7 @@ RUN apt-get clean && \
 COPY ./fs_overlay/usr/bin/archname /usr/bin/
 
 ENV S6_OVERLAY_VERSION=v3.2.3.0
-ENV DOCKER_GEN_VERSION=0.16.3
+ENV DOCKER_GEN_VERSION=0.16.4
 ENV ACME_TINY_VERSION=5.0.3
 
 RUN sh -c "wget -q https://github.com/just-containers/s6-overlay/releases/download/${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz -O /tmp/s6-overlay-noarch.tar.xz" && \
