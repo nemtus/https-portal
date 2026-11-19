@@ -1,0 +1,168 @@
+name: nemtus-image (build / publish)
+
+# NEMTUS-owned workflow that builds the https-portal image and, on a release tag, publishes
+# it to GHCR as ghcr.io/nemtus/https-portal. Upstream releases by hand from the maintainer's
+# machine (`make docker-multiarch-push`), so a security fix can sit unreleased after it is
+# merged; this gives NEMTUS its own release path. See docs/nemtus-fork.md.
+#
+# This file lives on the `nemtus` branch only. `master` stays a pure mirror of upstream so
+# that branches cut from it for upstream pull requests never carry NEMTUS files.
+#
+# Supply-chain posture: no third-party marketplace actions (only the SHA-pinned
+# actions/checkout); the build runs via the runner's preinstalled `docker buildx`, and the
+# QEMU binfmt image is pinned by digest. Least privilege: the `build` job is
+# `contents: read` only; `packages: write` lives solely in the `publish` job.
+#
+# Triggers:
+#   - pull_request / push to `nemtus` -> build (amd64) + smoke test only.
+#   - push of a tag `nemtus-vX.Y.Z` (optionally `nemtus-vX.Y.Z-N` for a NEMTUS re-release
+#     of the same upstream version) -> build + smoke test, then publish all platforms.
+#     X.Y.Z must equal the version in fs_overlay/etc/cont-init.d/00-welcome.
+#   - workflow_dispatch -> build + smoke test; with `push: true` also publish. Dispatched
+#     on a release tag it republishes that release with fresh base layers; dispatched on a
+#     branch it publishes only `:sha-<sha>`, never a version tag or `:latest`.
+
+on:
+  pull_request:
+    branches: [nemtus]
+  push:
+    branches: [nemtus]
+    tags:
+      - 'nemtus-v*'
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Publish the image to GHCR'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One pipeline per ref; never cancel an in-flight publish.
+concurrency:
+  group: nemtus-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/https-portal
+  # Same platforms as upstream's Makefile.
+  PLATFORMS: linux/386,linux/amd64,linux/arm/v7,linux/arm64/v8
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build (amd64, no push)
+        run: docker buildx build --pull --load -t https-portal:ci .
+
+      - name: Smoke test
+        run: .github/scripts/smoke-test.sh https-portal:ci
+
+  publish:
+    needs: build
+    if: >-
+      (github.event_name == 'push' && github.ref_type == 'tag') ||
+      (github.event_name == 'workflow_dispatch' && inputs.push == true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide tags
+        id: meta
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short HEAD)"
+
+          if [ "${REF_TYPE}" != tag ]; then
+            # A dispatch from a branch publishes only the commit-addressed tag, so an
+            # unreleased build can never take over a version tag or :latest.
+            echo "::warning::'${REF_NAME}' is not a release tag; publishing only :sha-${sha}."
+            echo "tags=${IMAGE}:sha-${sha}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! printf '%s' "${REF_NAME}" | grep -Eq '^nemtus-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$'; then
+            echo "::error::tag '${REF_NAME}' must look like nemtus-vX.Y.Z or nemtus-vX.Y.Z-N"
+            exit 1
+          fi
+          release="${REF_NAME#nemtus-v}"   # 1.25.7 or 1.25.7-2
+          version="${release%%-*}"         # 1.25.7
+          banner="$(sed -n 's/^HTTPS-PORTAL v\(.*\)$/\1/p' fs_overlay/etc/cont-init.d/00-welcome)"
+          if [ "${version}" != "${banner}" ]; then
+            echo "::error::tag version ${version} does not match the 00-welcome banner (v${banner})"
+            exit 1
+          fi
+
+          minor="${version%.*}"
+          major="${version%%.*}"
+          tags="${IMAGE}:sha-${sha},${IMAGE}:${version},${IMAGE}:${minor},${IMAGE}:${major},${IMAGE}:latest"
+          if [ "${release}" != "${version}" ]; then
+            tags="${tags},${IMAGE}:${release}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (arm/v7, arm64)
+        run: docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 --install arm,arm64
+
+      - name: Set up buildx
+        run: docker buildx create --use --name nemtus --driver docker-container
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+
+      # No layer cache: the Dockerfile runs `apt-get upgrade`, and a cached layer would
+      # silently skip the OS updates a release (or a re-release) is meant to pick up.
+      - name: Build and publish (GHCR)
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          IFS=',' read -ra tag_list <<< "${TAGS}"
+          for tag in "${tag_list[@]}"; do
+            tag_args+=(-t "${tag}")
+          done
+          docker buildx build \
+            --pull --no-cache \
+            --platform "${PLATFORMS}" \
+            --provenance=true --sbom=true \
+            --metadata-file "${RUNNER_TEMP}/build-meta.json" \
+            "${tag_args[@]}" \
+            --push \
+            .
+
+      - name: Record publish evidence
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          digest="$(jq -r '."containerimage.digest" // "unknown"' "${RUNNER_TEMP}/build-meta.json")"
+          {
+            echo "## https-portal image published"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tags | \`${TAGS}\` |"
+            echo "| digest | \`${digest}\` |"
+            echo "| platforms | \`${PLATFORMS}\` |"
+            echo "| source revision | \`${GITHUB_SHA}\` |"
+            echo "| attestations | SBOM + SLSA provenance attached via buildx |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::Published ${IMAGE} @ ${digest}"
