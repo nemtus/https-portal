@@ -21,6 +21,9 @@ name: nemtus-image (build / publish)
 #   - workflow_dispatch -> build + smoke test; with `push: true` also publish. Dispatched
 #     on a release tag it republishes that release with fresh base layers; dispatched on a
 #     branch it publishes only `:sha-<sha>`, never a version tag or `:latest`.
+#     mirror-sync.yml dispatches it (without push) on each sync branch.
+#
+# Publishing is refused unless the commit is on the `nemtus` branch.
 
 on:
   pull_request:
@@ -82,11 +85,20 @@ jobs:
       - name: Decide tags
         id: meta
         env:
+          GH_TOKEN: ${{ github.token }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           sha="$(git rev-parse --short HEAD)"
+
+          # Publish only commits that are on `nemtus`, i.e. that went through a pull
+          # request. A tag or a dispatch on any other commit must not reach the registry.
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/nemtus...${GITHUB_SHA}" --jq '.status')"
+          if [ "${status}" != identical ] && [ "${status}" != behind ]; then
+            echo "::error::${GITHUB_SHA} is not on the nemtus branch (compare status: ${status}); refusing to publish."
+            exit 1
+          fi
 
           if [ "${REF_TYPE}" != tag ]; then
             # A dispatch from a branch publishes only the commit-addressed tag, so an
